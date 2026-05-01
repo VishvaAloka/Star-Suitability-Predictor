@@ -23,7 +23,7 @@ def main():
 
     url = f"https://drive.google.com/uc?id={FILE_ID}"
     print("Downloading model.zip from Google Drive...")
-    gdown.download(url, str(ZIP_PATH), quiet=False, fuzzy=True)
+    gdown.download(url, str(ZIP_PATH), quiet=False)
 
     extract_dir = TMP_DIR / "extracted"
     extract_dir.mkdir(parents=True, exist_ok=True)
