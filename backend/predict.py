@@ -1,0 +1,222 @@
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+import numpy as np
+import joblib
+from pathlib import Path
+import gc
+
+router = APIRouter(prefix="/predict")
+
+# ======================================================
+# PATH SETUP
+# ======================================================
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_DIR = BASE_DIR / "model"
+
+
+# ======================================================
+# INPUT SCHEMA
+# ======================================================
+class UGRIZInput(BaseModel):
+    U: float
+    G: float
+    R: float
+    I: float
+    Z: float
+    apply_extinction: bool = False
+    ebv: float = 0.0
+
+
+# ======================================================
+# SDSS COLOR RANGES
+# ======================================================
+COLOR_RANGES = {
+    "u_g": (-0.5, 2.8),
+    "g_r": (-0.4, 1.6),
+    "r_i": (-0.4, 1.3),
+    "i_z": (-0.4, 1.1),
+}
+
+
+# ======================================================
+# SDSS EXTINCTION COEFFICIENTS (Rv=3.1)
+# ======================================================
+EXTINCTION_COEFFICIENTS = {
+    "U": 4.700,
+    "G": 3.630,
+    "R": 2.650,
+    "I": 2.010,
+    "Z": 1.540,
+}
+
+
+# ======================================================
+# HELPERS
+# ======================================================
+def reliability_label(conf):
+    if conf >= 80:
+        return "High"
+    elif conf >= 55:
+        return "Medium"
+    return "Low"
+
+
+def feature_influence(X, model, scaler, noise=0.02):
+    base = model.predict(scaler.transform(X))[0]
+    impacts = []
+
+    for i in range(X.shape[1]):
+        Xp = X.copy()
+        Xp[0, i] += noise
+        pert = model.predict(scaler.transform(Xp))[0]
+        impacts.append(abs(pert - base))
+
+    impacts = np.array(impacts)
+    if impacts.sum() == 0:
+        return [25, 25, 25, 25]
+
+    return (impacts / impacts.sum() * 100).round(1).tolist()
+
+
+# ======================================================
+# ENDPOINT
+# ======================================================
+@router.post("/")
+def predict(input: UGRIZInput):
+    try:
+        # Apply extinction correction if requested
+        extinction_applied = False
+        ebv_used = 0.0
+
+        U_mag = input.U
+        G_mag = input.G
+        R_mag = input.R
+        I_mag = input.I
+        Z_mag = input.Z
+
+        if input.apply_extinction and input.ebv > 0:
+            extinction_applied = True
+            ebv_used = input.ebv
+
+            A_U = EXTINCTION_COEFFICIENTS["U"] * input.ebv
+            A_G = EXTINCTION_COEFFICIENTS["G"] * input.ebv
+            A_R = EXTINCTION_COEFFICIENTS["R"] * input.ebv
+            A_I = EXTINCTION_COEFFICIENTS["I"] * input.ebv
+            A_Z = EXTINCTION_COEFFICIENTS["Z"] * input.ebv
+
+            U_mag = input.U - A_U
+            G_mag = input.G - A_G
+            R_mag = input.R - A_R
+            I_mag = input.I - A_I
+            Z_mag = input.Z - A_Z
+
+        # Compute color indices
+        u_g = U_mag - G_mag
+        g_r = G_mag - R_mag
+        r_i = R_mag - I_mag
+        i_z = I_mag - Z_mag
+
+        X = np.array([[u_g, g_r, r_i, i_z]])
+
+        valid_colors = True
+        warnings = []
+
+        for key, value in zip(["u_g", "g_r", "r_i", "i_z"], X[0]):
+            lo, hi = COLOR_RANGES[key]
+            if not (lo <= value <= hi):
+                valid_colors = False
+                warnings.append(f"{key}={value:.2f} outside SDSS range")
+
+        N = 30
+        sigma = 0.02
+        noise = np.random.normal(0, sigma, size=(N, X.shape[1]))
+        Xn_batch = X + noise
+
+        # ---------- Teff ----------
+        teff_scaler = joblib.load(MODEL_DIR / "teff" / "scaler.pkl")
+        teff_model = joblib.load(MODEL_DIR / "teff" / "Teff_model.pkl")
+
+        teff_vals = teff_model.predict(teff_scaler.transform(Xn_batch))
+        Teff = float(np.mean(teff_vals))
+        Teff_unc = float(np.std(teff_vals))
+
+        color_influence = feature_influence(X, teff_model, teff_scaler)
+
+        del teff_scaler, teff_model, teff_vals
+        gc.collect()
+
+        # ---------- Metallicity ----------
+        metal_scaler = joblib.load(MODEL_DIR / "metallicity" / "scaler.pkl")
+        metal_model = joblib.load(MODEL_DIR / "metallicity" / "Metallicity_model.pkl")
+        metal_le = joblib.load(MODEL_DIR / "metallicity" / "label_encoder.pkl")
+
+        metal_encoded = metal_model.predict(metal_scaler.transform(Xn_batch))
+        metal_vals = metal_le.inverse_transform(metal_encoded)
+
+        Metallicity_Class, Metallicity_conf = np.unique(metal_vals, return_counts=True)
+        Metallicity_Class = Metallicity_Class[np.argmax(Metallicity_conf)]
+        Metallicity_conf = int(100 * np.max(Metallicity_conf) / N)
+
+        del metal_scaler, metal_model, metal_le, metal_encoded, metal_vals
+        gc.collect()
+
+        # ---------- Spectral ----------
+        spectral_scaler = joblib.load(MODEL_DIR / "spectral" / "spectral_scaler.pkl")
+        spectral_model = joblib.load(MODEL_DIR / "spectral" / "spectral_type_rf_model.pkl")
+        spectral_le = joblib.load(MODEL_DIR / "spectral" / "spectral_label_encoder.pkl")
+
+        spec_encoded = spectral_model.predict(spectral_scaler.transform(Xn_batch))
+        spec_vals = spectral_le.inverse_transform(spec_encoded)
+
+        Spectral_Type, Spectral_conf = np.unique(spec_vals, return_counts=True)
+        Spectral_Type = Spectral_Type[np.argmax(Spectral_conf)]
+        Spectral_conf = int(100 * np.max(Spectral_conf) / N)
+
+        del spectral_scaler, spectral_model, spectral_le, spec_encoded, spec_vals
+        gc.collect()
+
+        # ---------- Exo ----------
+        exo_scaler = joblib.load(MODEL_DIR / "Exo" / "scaler.pkl")
+        exo_model = joblib.load(MODEL_DIR / "Exo" / "life_supporting_star_rf_model.pkl")
+        exo_le = joblib.load(MODEL_DIR / "Exo" / "label_encoder.pkl")
+
+        exo_encoded = exo_model.predict(exo_scaler.transform(Xn_batch))
+        exo_vals = exo_le.inverse_transform(exo_encoded)
+
+        Life_Supporting, Exo_conf = np.unique(exo_vals, return_counts=True)
+        Life_Supporting = Life_Supporting[np.argmax(Exo_conf)]
+        Exo_conf = int(100 * np.max(Exo_conf) / N)
+
+        del exo_scaler, exo_model, exo_le, exo_encoded, exo_vals
+        gc.collect()
+
+        overall_conf = int((Spectral_conf + Metallicity_conf + Exo_conf) / 3)
+
+        return {
+            "u_g": u_g,
+            "g_r": g_r,
+            "r_i": r_i,
+            "i_z": i_z,
+            "valid_colors": valid_colors,
+            "warnings": warnings,
+            "Teff": Teff,
+            "Teff_uncertainty": Teff_unc,
+            "Metallicity_Class": Metallicity_Class,
+            "Metallicity_confidence": Metallicity_conf,
+            "Spectral_Type": Spectral_Type,
+            "Spectral_confidence": Spectral_conf,
+            "Life_Supporting_Star": Life_Supporting,
+            "Life_Supporting_confidence": Exo_conf,
+            "Prediction_reliability": reliability_label(overall_conf),
+            "color_influence": {
+                "u-g": color_influence[0],
+                "g-r": color_influence[1],
+                "r-i": color_influence[2],
+                "i-z": color_influence[3],
+            },
+            "extinction_applied": extinction_applied,
+            "ebv_used": ebv_used,
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
