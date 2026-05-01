@@ -9,7 +9,6 @@ app = FastAPI()
 origins = [
     os.getenv("RAILWAY_FRONTEND_URL", "http://localhost:3000"),
     "http://localhost:3000",
-    "https://star-suitability-predictor-production-5e6f.up.railway.app",
 ]
 
 app.add_middleware(
