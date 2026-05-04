@@ -21,7 +21,7 @@ const HomePage = ({
 }) => (
   <>
     <div style={{ padding: "90px 20px 0 20px", textAlign: "center" }}>
-      <h1 className="typing-title">Stellar Classification & Habitability Predictor</h1>
+      <h1 className="typing-title">Stellar Classification & Suitability Predictor</h1>
     </div>
     <div style={{ display: "flex", justifyContent: "space-around", alignItems: "flex-start", padding: "20px" }}>
       <div style={{ width: "45%", marginTop: "20px" }}>
